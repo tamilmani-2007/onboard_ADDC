@@ -1,0 +1,4 @@
+pymavlink==2.4.49
+opencv-python-headless>=4.9
+pupil_apriltags==1.0.4.post11
+picamera2>=0.3.23

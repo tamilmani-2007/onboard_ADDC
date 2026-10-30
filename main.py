@@ -1,0 +1,251 @@
+import sys
+import time
+from quad.connection import get_master
+from quad.telemetry_thread import TelemetryThread
+from quad.state import get_state
+from quad import quad
+from quad.const import takeoff_alt, auto_arm, stream_enabled
+from utils.logger import logger
+from mission import mission_manager, MissionState
+from quad.operation import (
+    start_vision,
+    stop_vision,
+    handle_apriltag_tracking_state,
+    handle_qr_search_state,
+    handle_qr_approach_state,
+    handle_qr_hover_state,
+    handle_hover_state,
+    handle_emergency_state,
+    calculate_time_to_home,
+    qr_found,
+    qr_decoded_for,
+)
+from utils import config as cfg
+from cam import runtime
+from utils.config import (
+    MISSION_TIMEOUT, HOVER_TIME, HUMAN_TRACKING_TIME, QR_LOST_TIMEOUT, QR_DECODE_TIMEOUT,
+)
+
+master = get_master()
+state = get_state()
+MAX_GROUND_ALT_ERROR = 2.0   # m: relative altitude must read ~0 before takeoff
+MS = MissionState
+
+
+def wait_until(cond, timeout, what, period=0.2):
+    end = time.time() + timeout
+    while time.time() < end:
+        if state.pilot_override:
+            return False
+        if cond():
+            return True
+        time.sleep(period)
+    logger.error(f"Timeout waiting for {what}")
+    return False
+
+
+def preflight():
+    """Everything that must be true BEFORE the vehicle is armed. Returns True if OK."""
+    if not wait_until(lambda: state.heartbeat, 10, "autopilot heartbeat"):
+        return False
+    if not wait_until(lambda: state.gps_ready, 60, "3D GPS fix"):
+        return False
+    if state.armed:
+        logger.error("Vehicle is already armed - refusing to start a mission")
+        return False
+    # The pilot must be able to take over: refuse to fly without a live RC signal (mode switch + throttle channel).
+    if not wait_until(lambda: state.rc_chancount is not None, 6, "RC_CHANNELS data"):
+        logger.error("No RC_CHANNELS from the flight controller - cannot verify the transmitter. Not flying.")
+        return False
+    ch = state.rc_channels or []
+    if not state.rc_chancount or len(ch) < 5 or not (900 <= ch[2] <= 2100) or not (900 <= ch[4] <= 2100):
+        logger.error(f"No valid RC input (chancount {state.rc_chancount}, ch3 {ch[2:3]}, ch5 {ch[4:5]}): transmitter off "
+                     f"or receiver not connected - you could not take over. Not flying.")
+        return False
+    if abs(state.alt or 0.0) > MAX_GROUND_ALT_ERROR:
+        logger.error(f"Altitude reads {state.alt:.1f} m on the ground (barometer drift / not settled). The "
+                     f"takeoff checks would be fooled - not flying. Let the FC settle or reboot it.")
+        return False
+    if not start_vision(stream=stream_enabled):
+        return False
+    return True
+
+
+def main():
+    telemetry = TelemetryThread()
+    telemetry.start()
+    state.connected = True
+    mission_manager.update_state(MS.INITIALIZING)
+    logger.info("ADDC Mission Starting")
+
+    try:
+        if not preflight():
+            logger.error("Pre-flight failed - not flying")
+            return
+        mission_manager.update_state(MS.MAVLINK_CONNECTED)
+        mission_manager.update_state(MS.READY)
+        mission_manager.set_home_position(state.lat, state.lon, state.alt)
+
+        last_rtl_log = 0.0
+        vision_bad_since = None
+        ceiling_landing = False
+        # Main mission loop
+        while mission_manager.current_state != MS.COMPLETE:
+            # Safety checks
+            if mission_manager.current_state != MS.EMERGENCY:
+                if mission_manager.is_mavlink_lost():
+                    logger.error("MAVLink connection lost - entering emergency state")
+                    mission_manager.update_state(MS.EMERGENCY)
+                elif mission_manager.is_mission_timeout():
+                    logger.error("Mission timeout exceeded - entering emergency state")
+                    mission_manager.update_state(MS.EMERGENCY)
+
+            if state.pilot_override:
+                logger.warning("PILOT OVERRIDE (flight mode changed from the RC): the mission stops here and "
+                               "sends no more commands. The aircraft is yours.")
+                break
+
+            # Altitude ceiling: above MAX_ALTITUDE + margin (runaway climb or barometer error) -> land at once.
+            if (not ceiling_landing and state.armed and state.alt is not None
+                    and state.alt > cfg.MAX_ALTITUDE + cfg.CEILING_MARGIN):
+                logger.error(f"ALTITUDE CEILING: {state.alt:.1f} m > {cfg.MAX_ALTITUDE + cfg.CEILING_MARGIN:.1f} m - landing")
+                ceiling_landing = True
+                quad.setmode("LAND")
+                mission_manager.update_state(MS.LAND)
+
+            cur = mission_manager.current_state
+
+            # Camera failsafe: no frames for VISION_LOSS_LAND_AFTER s while flying on vision -> land.
+            if cur in (MS.HUMAN_TRACKING, MS.QR_SEARCH, MS.QR_DETECTED, MS.HOVER):
+                v = runtime.get_vision()
+                if v is None or v.frame_age() > cfg.VIDEO_TIMEOUT:
+                    vision_bad_since = vision_bad_since or time.time()
+                    if time.time() - vision_bad_since > cfg.VISION_LOSS_LAND_AFTER:
+                        logger.error("CAMERA LOST - no frames, landing")
+                        mission_manager.update_state(MS.EMERGENCY)
+                        continue
+                else:
+                    vision_bad_since = None
+
+            if cur == MS.READY:
+                # GUIDED first (the takeoff command needs it), then arm - by us or by the pilot on the RC.
+                if not quad.setmode("GUIDED"):
+                    logger.error("Cannot enter GUIDED - aborting")
+                    break
+                if auto_arm:
+                    logger.info("Arming")
+                    if not quad.arm():
+                        break
+                elif not state.armed:
+                    logger.info("GUIDED. Waiting for the pilot to arm (RC)...")
+                    if not wait_until(lambda: state.armed, 120, "arming by the pilot", 0.5):
+                        break
+                if state.mode != "GUIDED":
+                    logger.error(f"Armed in {state.mode}, not GUIDED - the pilot has the aircraft, not taking over")
+                    break
+                # From here on any other mode (except RTL / LAND) means the pilot took over.
+                state.allowed_modes = {"GUIDED", "RTL", "SMART_RTL", "LAND"}
+                mission_manager.update_state(MS.TAKEOFF)
+
+            elif cur == MS.TAKEOFF:
+                logger.info(f"Initiating takeoff to {takeoff_alt} m")
+                if not quad.takeoff(takeoff_alt):
+                    logger.error("Takeoff rejected")
+                    quad.disarm()      # no-op if the pilot has taken over
+                    break
+                if wait_until(lambda: state.alt is not None and state.alt >= takeoff_alt - 0.7, 30,
+                              "takeoff altitude"):
+                    logger.info(f"Takeoff complete - {state.alt:.1f} m")
+                    mission_manager.update_state(MS.HUMAN_TRACKING)
+                else:
+                    logger.error("Takeoff altitude not reached - landing")
+                    mission_manager.update_state(MS.EMERGENCY)
+
+            elif cur == MS.HUMAN_TRACKING:
+                # Follow the AprilTag (it only leads to the QR); a QR coming into view takes over at once.
+                handle_apriltag_tracking_state()
+                if qr_found():
+                    logger.info("QR located while tracking - moving to it")
+                    mission_manager.update_state(MS.QR_DETECTED)
+                elif mission_manager.get_time_in_state() > HUMAN_TRACKING_TIME:
+                    logger.info("Transitioning to QR search after human tracking")
+                    mission_manager.update_state(MS.QR_SEARCH)
+
+            elif cur == MS.QR_SEARCH:
+                if handle_qr_search_state():
+                    logger.info("QR located - moving to it")
+                    mission_manager.update_state(MS.QR_DETECTED)
+
+            elif cur == MS.QR_DETECTED:
+                # Centre over the QR and descend to the hover altitude (1 m)
+                status = handle_qr_approach_state()
+                if status == "ready":
+                    logger.info("Over the QR at hover altitude - decoding")
+                    mission_manager.update_state(MS.HOVER)
+                elif status == "lost":
+                    if mission_manager.get_time_in_state() > QR_LOST_TIMEOUT and not qr_found():
+                        logger.warning("QR lost during the approach - searching again")
+                        mission_manager.update_state(MS.QR_SEARCH)
+                else:
+                    mission_manager.state_start_time = time.time()   # approach in progress: reset the lost timer
+
+            elif cur == MS.HOVER:
+                text = handle_qr_hover_state()
+                if text and qr_decoded_for() >= HOVER_TIME:
+                    logger.info(f"QR '{text}' decoded and reported; hover completed - calculating dynamic RTL")
+                    mission_manager.update_state(MS.DYNAMIC_RTL)
+                elif not text and mission_manager.get_time_in_state() > QR_DECODE_TIMEOUT:
+                    logger.error("QR could not be decoded at the hover point - returning")
+                    mission_manager.update_state(MS.DYNAMIC_RTL)
+
+            elif cur == MS.DYNAMIC_RTL:
+                home_pos = mission_manager.home_position
+                if home_pos is not None and state.lat is not None:
+                    home_lat, home_lon, home_alt = home_pos
+                    distance_meters, time_seconds = calculate_time_to_home(
+                        state.lat, state.lon, state.alt or 0.0,
+                        home_lat, home_lon, home_alt,
+                        state.speed if state.speed is not None else 1.0)
+                    mission_remaining = MISSION_TIMEOUT - mission_manager.get_mission_time()
+                    if time.time() - last_rtl_log > 5:
+                        last_rtl_log = time.time()
+                        logger.info(f"Dynamic RTL - distance {distance_meters:.1f} m, "
+                                    f"time home {time_seconds:.1f} s, mission remaining {mission_remaining:.1f} s")
+                    if time_seconds > mission_remaining or distance_meters < 5.0:
+                        logger.info("Initiating dynamic RTL")
+                        quad.setmode("RTL")
+                        mission_manager.update_state(MS.LAND)
+                    else:
+                        handle_hover_state()
+                else:
+                    logger.warning("Home position not set - landing instead of RTL")
+                    quad.setmode("LAND")
+                    mission_manager.update_state(MS.LAND)
+
+            elif cur == MS.LAND:
+                # RTL handles the landing; finish when we are down / disarmed.
+                if not state.armed or (state.alt is not None and state.alt < 0.5):
+                    logger.info("Landed")
+                    mission_manager.update_state(MS.COMPLETE)
+
+            elif cur == MS.EMERGENCY:
+                handle_emergency_state()
+                if not state.armed or (state.alt is not None and state.alt < 0.5):
+                    logger.info("Landed in emergency state - completing mission")
+                    mission_manager.update_state(MS.COMPLETE)
+
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        logger.error("Keyboard Interruption Occur!..")
+        print("Enter into LAND")
+        quad.setmode("LAND")
+
+    finally:
+        stop_vision()          # releases the camera and restarts the video services
+        telemetry.stop()
+        telemetry.join(timeout=3)
+
+
+if __name__ == "__main__":
+    main()

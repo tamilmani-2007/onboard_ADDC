@@ -1,0 +1,221 @@
+"""
+Camera capture abstraction for onboard processing (Raspberry Pi Camera V2 / IMX219 over CSI).
+
+Every source exposes an OpenCV-like interface (isOpened / read / release) plus read_gray(), the fast path the
+vision thread uses: a single-channel uint8 frame with no colour conversion.
+
+Picamera2Capture
+  * sensor runs in the full-field-of-view binned mode (1640x1232), the ISP scales it for us, so no CPU resize;
+  * detection frames come from a YUV420 stream: the Y plane IS the grayscale image (zero-copy slice);
+  * optionally the same capture feeds the hardware H.264 encoder -> gst-launch -> RTP/UDP to the GCS, so video
+    transmission and detection share the one camera (it can only be opened by one process).
+"""
+import queue
+import subprocess
+import threading
+
+from utils.logger import logger
+
+
+def _make_drop_output(pipe, maxsize=45):
+    """picamera2 Output that hands encoded frames to a writer thread through a bounded queue and DROPS them
+    when the pipe is stuck (GCS gone / link stalled). A blocking write here would block the encoder and starve
+    the camera, freezing the AprilTag/QR detection that shares this capture."""
+    from picamera2.outputs import Output
+
+    class DropOutput(Output):
+        def __init__(self):
+            super().__init__()
+            self._q = queue.Queue(maxsize)
+            self.dropped = 0
+            threading.Thread(target=self._writer, name="Stream Writer", daemon=True).start()
+
+        def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False):
+            try:
+                self._q.put_nowait(bytes(frame))
+            except queue.Full:
+                self.dropped += 1
+
+        def _writer(self):
+            while True:
+                data = self._q.get()
+                if data is None:
+                    return
+                try:
+                    pipe.write(data)
+                    pipe.flush()
+                except (BrokenPipeError, ValueError, OSError):
+                    return
+
+        def close_writer(self):
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    return DropOutput()
+
+
+class Picamera2Capture:
+    """Wraps Picamera2 so it can be used like cv2.VideoCapture."""
+
+    def __init__(self, size=(640, 480), fps=30, stream=None):
+        """stream: None, or dict(host=, port=, size=(w, h), bitrate=) to also send H.264 to the GCS."""
+        from picamera2 import Picamera2
+
+        self._size = size
+        self._cam = Picamera2()
+        self._gst = None
+        self._stream = None
+        self._out = None
+        sensor = {"output_size": (1640, 1232), "bit_depth": 10}
+        controls = {"FrameRate": fps}
+
+        if stream:
+            config = self._cam.create_video_configuration(
+                main={"size": tuple(stream["size"]), "format": "YUV420"},
+                lores={"size": size, "format": "YUV420"},
+                sensor=sensor, controls=controls, buffer_count=4, encode="main")
+            self._detect_stream = "lores"
+        else:
+            config = self._cam.create_video_configuration(
+                main={"size": size, "format": "YUV420"},
+                sensor=sensor, controls=controls, buffer_count=4)
+            self._detect_stream = "main"
+        self._cam.configure(config)
+
+        if stream:
+            self._start_stream(stream)
+        else:
+            self._cam.start()
+        self._opened = True
+
+    def _start_stream(self, stream):
+        from picamera2.encoders import H264Encoder
+
+        self._gst = subprocess.Popen(
+            ["gst-launch-1.0", "-q", "fdsrc", "fd=0", "!", "h264parse", "config-interval=-1", "!",
+             "rtph264pay", "pt=96", "mtu=1400", "config-interval=-1", "!",
+             "udpsink", f"host={stream['host']}", f"port={stream['port']}", "sync=false"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            encoder = H264Encoder(bitrate=stream["bitrate"], repeat=True, iperiod=15)
+        except TypeError:
+            encoder = H264Encoder(bitrate=stream["bitrate"])
+        self._out = _make_drop_output(self._gst.stdin)
+        self._cam.start_recording(encoder, self._out)
+        self._stream = stream
+        logger.info(f"Streaming H.264 {stream['size'][0]}x{stream['size'][1]} to "
+                    f"{stream['host']}:{stream['port']}")
+
+    def isOpened(self):
+        return self._opened
+
+    def read_gray(self):
+        """(ok, HxW uint8 gray frame). The Y plane of the YUV420 buffer, no conversion."""
+        if not self._opened:
+            return False, None
+        arr = self._cam.capture_array(self._detect_stream)
+        h, w = self._size[1], self._size[0]
+        return True, arr[:h, :w]
+
+    def read(self):
+        """(ok, HxWx3 BGR frame) - compatibility path, slower than read_gray()."""
+        import cv2 as cv
+        if not self._opened:
+            return False, None
+        arr = self._cam.capture_array(self._detect_stream)
+        return True, cv.cvtColor(arr, cv.COLOR_YUV420p2BGR)
+
+    def release(self):
+        if not self._opened:
+            return
+        self._opened = False
+        try:
+            if self._stream:
+                self._cam.stop_recording()
+            else:
+                self._cam.stop()
+            self._cam.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Camera shutdown: {e}")
+        if self._out is not None:
+            self._out.close_writer()
+        if self._gst is not None:
+            try:
+                self._gst.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._gst.terminate()
+            self._gst = None
+
+
+class CvCapture:
+    """cv2.VideoCapture with the same read_gray() fast path."""
+
+    def __init__(self, cap):
+        self._cap = cap
+
+    def isOpened(self):
+        return self._cap.isOpened()
+
+    def read(self):
+        return self._cap.read()
+
+    def read_gray(self):
+        import cv2 as cv
+        ok, frame = self._cap.read()
+        if not ok:
+            return False, None
+        return True, (frame if frame.ndim == 2 else cv.cvtColor(frame, cv.COLOR_BGR2GRAY))
+
+    def release(self):
+        self._cap.release()
+
+
+def open_capture(video_source: str, video_source_path: str, camera_width: int, camera_height: int,
+                 fps: int = 30, stream=None):
+    """Open a video capture source and return an OpenCV-like object, or None on failure."""
+    import cv2 as cv
+
+    if video_source == "picamera2":
+        try:
+            cap = Picamera2Capture(size=(camera_width, camera_height), fps=fps, stream=stream)
+            logger.info("Opened Raspberry Pi camera via picamera2")
+            return cap
+        except Exception as e:
+            logger.error(f"Could not open picamera2 source: {e}  "
+                         "(the camera is probably held by fpv-video-ap.service / rpicam-vid: stop it first)")
+            return None
+
+    if video_source == "v4l2":
+        cap = cv.VideoCapture(video_source_path, cv.CAP_V4L2)
+        if not cap.isOpened():
+            logger.error(f"Could not open V4L2 device: {video_source_path}")
+            return None
+        logger.info(f"Opened V4L2 device: {video_source_path}")
+        return CvCapture(cap)
+
+    if video_source == "webcam":
+        for i in range(4):
+            cap = cv.VideoCapture(i)
+            if cap.isOpened():
+                logger.info(f"Opened webcam at index {i}")
+                return CvCapture(cap)
+            cap.release()
+        logger.error("Could not open any webcam")
+        return None
+
+    if video_source in ("video_file", "udp", "rtsp", "http"):
+        if not video_source_path:
+            logger.error(f"VIDEO_SOURCE_PATH not set for {video_source} source")
+            return None
+        cap = cv.VideoCapture(video_source_path)
+        if not cap.isOpened():
+            logger.error(f"Could not open {video_source}: {video_source_path}")
+            return None
+        logger.info(f"Opened {video_source}: {video_source_path}")
+        return CvCapture(cap)
+
+    logger.error(f"Unknown VIDEO_SOURCE: {video_source}")
+    return None

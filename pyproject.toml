@@ -1,0 +1,12 @@
+[project]
+name = "onboard-addc"
+version = "0.1.0"
+description = "ADDC onboard autonomous human tracking system (runs on the air unit Raspberry Pi 4)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pymavlink>=2.4.49",
+    "opencv-python-headless>=4.9",
+    "pupil-apriltags>=1.0.4.post11",
+    "picamera2>=0.3.23",
+]

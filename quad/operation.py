@@ -1,0 +1,265 @@
+import math
+import time
+
+from utils.logger import logger
+from typing import Tuple
+from quad import quad
+from quad.state import get_state
+from tracking.controller import pixel_velocity, pid_x, pid_y
+from cam import runtime
+from cam.runtime import start_vision, stop_vision  # noqa: F401  (re-exported for main.py)
+from utils.config import (
+    DRY_RUN, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_OFFSET_FORWARD_M, TAKEOFF_ALTITUDE,
+    QR_SEARCH_ALTITUDE, QR_HOVER_ALT, QR_MIN_ALT, QR_DESCENT_RATE, QR_DECODE_DESCENT_RATE, QR_CLIMB_RATE, QR_CENTER_TOL_M,
+    QR_DECODE_TIMEOUT, QR_REPORT_PERIOD, QR_RESULT_FILE, SURVEY_ALTITUDE,
+)
+from utils.utils import get_pixel_length
+from mission import mission_manager
+
+state = get_state()
+
+WAYPOINT_TOLERANCE = 2.0
+EARTH_RADIUS = 6371000
+
+_emergency_sent = False
+_last_log = 0.0
+_qr_decoded = None        # confirmed text
+_qr_decoded_at = 0.0
+_qr_last_report = 0.0
+_qr_last_seen = 0.0
+
+
+# ---- helpers ------------------------------------------------------------------------------------------
+def send_velocity_command(vx, vy, vz=0.0):
+    """Send velocity command to drone (body frame: forward, right, DOWN)"""
+    if DRY_RUN:
+        logger.info(f"[DRY_RUN] Velocity command: vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}")
+        return
+    try:
+        quad.send_velocity(vx, vy, vz)
+    except Exception as e:
+        logger.error(f"Failed to send velocity command: {e}")
+
+
+def _hold():
+    send_velocity_command(0.0, 0.0, 0.0)
+
+
+def _alt_hold_vz(target_alt, rate):
+    """Vertical speed (+ = down) that moves state.alt towards target_alt at up to `rate` m/s."""
+    alt = state.alt if state.alt is not None else target_alt
+    err = target_alt - alt
+    if abs(err) < 0.15:
+        return 0.0
+    return -rate if err > 0 else rate
+
+
+def _ground_errors(center):
+    """Pixel centre -> (right, forward) ground error in metres, with the camera-ahead-of-FC offset removed.
+
+    Down-facing camera, image-up == nose. The camera is CAMERA_OFFSET_FORWARD_M ahead of the FC, so a target
+    directly under the FC appears that far BELOW the image centre."""
+    mx, my = get_pixel_length()
+    right = (center[0] - CAMERA_WIDTH / 2) * mx
+    forward = -((center[1] - CAMERA_HEIGHT / 2) * my - CAMERA_OFFSET_FORWARD_M)
+    return right, forward
+
+
+def _centre_on(center, vz):
+    """Steer over `center` (pixels) and command vertical speed vz. Returns the horizontal error in metres."""
+    right, forward = _ground_errors(center)
+    vx, vy = pixel_velocity(forward, right)
+    send_velocity_command(vx, vy, vz)
+    return math.hypot(right, forward)
+
+
+# ---- state handlers -----------------------------------------------------------------------------------
+def handle_apriltag_tracking_state():
+    """HUMAN_TRACKING: follow the AprilTag (detection only, its id is irrelevant); the QR is watched for at
+    the same time. True while the tag is seen."""
+    global _last_log
+    _vision = runtime.get_vision()
+    if _vision is None:
+        _hold()
+        return False
+    _vision.set_mode("both")
+    if _vision.frame_age() < 1.0:
+        mission_manager.update_video_frame()
+
+    tag = _vision.get_tag(max_age=0.5)
+    if tag is None:
+        _hold()
+        pid_x.reset()
+        pid_y.reset()
+        return False
+    mission_manager.update_apriltag_detection()
+
+    _centre_on(tag["center"], 0.0)
+    if time.time() - _last_log > 2.0:
+        _last_log = time.time()
+        right, forward = _ground_errors(tag["center"])
+        logger.info(f"AprilTag tracking: err right {right:.2f} m forward {forward:.2f} m | "
+                    f"vision {_vision.fps:.0f} fps | alt {state.alt}")
+    return True
+
+
+def qr_found():
+    """True once a QR has been located in several recent frames (it need not be decoded yet)."""
+    v = runtime.get_vision()
+    return v is not None and v.qr_located()
+
+
+def handle_qr_search_state():
+    """QR_SEARCH: hold position at the search altitude (a QR is locatable from there). True once located."""
+    v = runtime.get_vision()
+    if v is None:
+        _hold()
+        return False
+    v.set_mode("qr")
+    if v.frame_age() < 1.0:
+        mission_manager.update_video_frame()
+    if v.qr_located():
+        return True
+    send_velocity_command(0.0, 0.0, _alt_hold_vz(QR_SEARCH_ALTITUDE, 0.3))
+    return False
+
+
+def handle_qr_approach_state():
+    """QR_DETECTED: centre over the QR and descend to QR_HOVER_ALT (descend only while centred).
+    Returns "ready" (centred at hover altitude), "approaching" or "lost"."""
+    global _qr_last_seen
+    v = runtime.get_vision()
+    if v is None:
+        _hold()
+        return "lost"
+    v.set_mode("qr")
+    qr = v.get_qr(max_age=0.7)
+    if qr is None:
+        # out of view: hold, and after 1.5 s climb back to the search altitude so the field of view grows
+        lost_for = time.time() - _qr_last_seen
+        send_velocity_command(0.0, 0.0, _alt_hold_vz(QR_SEARCH_ALTITUDE, QR_CLIMB_RATE) if lost_for > 1.5 else 0.0)
+        pid_x.reset()
+        pid_y.reset()
+        return "lost"
+    _qr_last_seen = time.time()
+
+    alt = state.alt if state.alt is not None else QR_SEARCH_ALTITUDE
+    if alt < QR_MIN_ALT:
+        vz = -QR_CLIMB_RATE
+    elif alt > QR_HOVER_ALT + 0.15:
+        vz = QR_DESCENT_RATE      # corrected below if not centred
+    elif alt < QR_HOVER_ALT - 0.15:
+        vz = -0.2
+    else:
+        vz = 0.0
+    right, forward = _ground_errors(qr["center"])
+    err = math.hypot(right, forward)
+    if vz > 0 and err > QR_CENTER_TOL_M:
+        vz = 0.0                  # centre first, then descend
+    _centre_on(qr["center"], vz)
+
+    if abs(alt - QR_HOVER_ALT) <= 0.2 and err <= QR_CENTER_TOL_M:
+        return "ready"
+    return "approaching"
+
+
+def handle_qr_hover_state():
+    """HOVER at QR_HOVER_ALT: stay centred, decode (identical text several times), report it to the GCS.
+    Returns the confirmed text, or None while still decoding."""
+    global _qr_decoded, _qr_decoded_at, _qr_last_report
+    v = runtime.get_vision()
+    if v is None:
+        _hold()
+        return _qr_decoded
+    v.set_mode("qr")
+    qr = v.get_qr(max_age=0.7)
+    # Not decoded yet: keep lowering slowly (only while centred over the QR) until it decodes, never below
+    # QR_MIN_ALT. Decoded: stay at the current altitude.
+    alt = state.alt if state.alt is not None else QR_HOVER_ALT
+    if _qr_decoded or v.qr_confirmed():
+        vz = 0.0
+    elif alt < QR_MIN_ALT:
+        vz = -0.15                       # below the floor (altimeter noise): climb back
+    elif alt > QR_MIN_ALT + 0.05:
+        vz = QR_DECODE_DESCENT_RATE
+    else:
+        vz = 0.0                         # at the floor: hold and keep trying
+    if qr is not None:
+        if vz > 0 and math.hypot(*_ground_errors(qr["center"])) > QR_CENTER_TOL_M:
+            vz = 0.0                     # centre first, then lower
+        _centre_on(qr["center"], vz)
+    else:
+        send_velocity_command(0.0, 0.0, min(vz, 0.0))   # QR out of view: never descend blind
+
+    text = _qr_decoded or v.qr_confirmed()
+    if text and _qr_decoded is None:
+        _qr_decoded, _qr_decoded_at = text, time.time()
+        mission_manager.qr_result = text
+        state.decoded_data = text
+        logger.info(f"QR DECODED: '{text}'")
+        try:
+            with open(QR_RESULT_FILE, "w") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            logger.warning(f"Could not write {QR_RESULT_FILE}: {e}")
+    if _qr_decoded and time.time() - _qr_last_report >= QR_REPORT_PERIOD:
+        _qr_last_report = time.time()
+        quad.send_statustext(_qr_decoded)     # repeated: the link to the GCS can drop a message
+    return _qr_decoded
+
+
+def qr_decoded_for():
+    """Seconds since the QR text was confirmed (0 if not yet)."""
+    return time.time() - _qr_decoded_at if _qr_decoded else 0.0
+
+
+def handle_hover_state():
+    """Handle hovering in place"""
+    global _qr_last_report
+    if runtime.get_vision() is not None:
+        runtime.get_vision().set_mode("idle")
+    _hold()
+    # waiting for the dynamic-RTL moment: keep repeating the decoded text to the GCS (the link can drop messages)
+    if _qr_decoded and time.time() - _qr_last_report >= QR_REPORT_PERIOD:
+        _qr_last_report = time.time()
+        quad.send_statustext(_qr_decoded)
+    return True
+
+
+def handle_emergency_state():
+    """Emergency (MAVLink lost / mission timeout / takeoff altitude not reached): LAND where we are (sent once)."""
+    global _emergency_sent
+    if not _emergency_sent:
+        logger.warning("Executing emergency LAND")
+        quad.setmode("LAND")
+        _emergency_sent = True
+    return True
+
+
+def haversine_distance(lat1, lon1, lat2, lon2) -> float:
+    """
+    Calculate the great circle distance between two points
+    on the earth (specified in decimal degrees)
+    """
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return EARTH_RADIUS * c
+
+
+def calculate_time_to_home(current_lat, current_lon, current_alt,
+                          home_lat, home_lon, home_alt,
+                          current_speed_ms=1.0) -> Tuple[float, float]:
+    """
+    Calculate distance and estimated time to return to home position
+
+    Returns:
+        Tuple of (distance_meters, time_seconds)
+    """
+    horizontal_distance = haversine_distance(current_lat, current_lon, home_lat, home_lon)
+    vertical_distance = abs(current_alt - home_alt)
+    total_distance = math.sqrt(horizontal_distance**2 + vertical_distance**2)
+    speed = current_speed_ms if current_speed_ms and current_speed_ms > 0.5 else 1.0
+    return total_distance, total_distance / speed

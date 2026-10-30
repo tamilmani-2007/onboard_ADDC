@@ -1,0 +1,150 @@
+"""
+Configuration module for ADDC project.
+All tunable parameters should be defined here.
+"""
+
+# Camera Configuration (Raspberry Pi Camera Module V2, Sony IMX219, CSI)
+CAMERA_WIDTH = 640              # detection frame (grayscale, from the ISP "lores"/main stream)
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 30
+CAMERA_HORIZONTAL_FOV = 62.2    # degrees (IMX219 full-FoV 4:3 mode)
+CAMERA_VERTICAL_FOV = 48.8      # degrees
+# Camera is mounted pointing DOWN with image-up == vehicle nose (forward).
+# Tag right of centre -> fly right (vy+), tag above centre -> fly forward (vx+).
+# Camera position relative to the FC: 10 cm forward, 4 cm down. The forward offset is compensated so the
+# FC (not the camera) ends up over the tag; the 4 cm height is below the altitude noise and ignored.
+CAMERA_OFFSET_FORWARD_M = 0.10
+
+# Camera Specifications in metres (IMX219 + V2 lens)
+FOCAL_LENGTH = 0.00304
+SENSOR_WIDTH = 0.003674
+SENSOR_HEIGHT = 0.002760
+
+# Flight Parameters
+MAX_ALTITUDE = 4.0              # m - HARD safety ceiling: no configured altitude, --alt, or flight may exceed it
+CEILING_MARGIN = 0.5            # m - above MAX_ALTITUDE + this in flight the mission lands immediately
+FLIGHT_ALTITUDE = 3.0           # meters - default flight altitude
+TAKEOFF_ALTITUDE = 3.0          # meters
+SURVEY_ALTITUDE = 4.0           # meters - for waypoint navigation (unused; capped by MAX_ALTITUDE)
+WAYPOINT_TOLERANCE = 2.0        # meters - tolerance for waypoint reaching
+EARTH_RADIUS = 6371000          # meters
+
+# AprilTag Configuration
+APRILTAG_FAMILY = "tag36h11"          # the tag actually in use (was tag25h9)
+APRILTAG_NTHREADS = 3           # Pi 4 has 4 cores; leave one for MAVLink / encoder
+APRILTAG_QUAD_DECIMATE = 2.0    # full-frame search at half resolution (~3x faster)
+APRILTAG_ROI_QUAD_DECIMATE = 1.0  # tracking inside a small ROI around the last detection, full resolution
+APRILTAG_QUAD_SIGMA = 0.0
+APRILTAG_REFINE_EDGES = 1
+APRILTAG_DECODE_SHARPENING = 0.25
+APRILTAG_DEBUG = 0
+APRILTAG_MIN_MARGIN = 30        # reject weak detections (false positives on clutter)
+APRILTAG_MAX_HAMMING = 1
+APRILTAG_IDS = None             # the tag is only a tracking marker: any id is accepted (None)
+APRILTAG_ROI_PAD = 1.0          # ROI = tag bounding box padded by this many tag-widths on each side
+
+# QR Configuration
+QR_TRY_UPSCALE = True           # if a code is located but not decoded, retry on a 2x crop
+QR_MIN_SIDE_PX = 25             # smallest plausible QR side in the 640x480 frame (rejects clutter)
+QR_STABLE_PX = 40               # located centres must agree within this many px across the hits
+QR_SEARCH_ALTITUDE = 2.0        # m - hold here while searching: a ~20 cm QR is ~50 px wide, enough to LOCATE
+QR_HOVER_ALT = 1.0              # m - hover over the QR here to decode it (a ~20 cm QR is ~105 px, >4 px/module)
+QR_MIN_ALT = 0.8                # m - never descend below this
+QR_DESCENT_RATE = 0.3           # m/s - descent towards the QR (only while centred)
+QR_CLIMB_RATE = 0.3             # m/s - climb back if the QR is lost
+QR_CENTER_TOL_M = 0.2           # m - horizontal error under which descending / "ready" is allowed
+QR_CONFIRM_COUNT = 3            # identical decodes needed before the text is trusted
+QR_DECODE_TIMEOUT = 20          # s - give up decoding at the hover point after this long
+QR_LOST_TIMEOUT = 6             # s - QR out of view this long during the approach -> back to QR search
+QR_REPORT_PERIOD = 2.0          # s - repeat the decoded text to the GCS while hovering
+QR_RESULT_FILE = "/home/ubuntu/qr_result.txt"
+
+# Controller Configuration
+KP_X = 0.3                      # Proportional gain for X axis
+KP_Y = 0.3                      # Proportional gain for Y axis
+KI_X = 0.05                     # Integral gain for X axis
+KI_Y = 0.05                     # Integral gain for Y axis
+KD_X = 0.1                      # Derivative gain for X axis
+KD_Y = 0.1                      # Derivative gain for Y axis
+MAX_VELOCITY = 1.0              # m/s - maximum velocity output
+DEADBAND = 0.10                 # meters - deadband for error
+INTEGRAL_WINDUP_LIMIT = 0.5     # meters - integral windup protection
+
+# Mission Timing
+MISSION_TIMEOUT = 300           # seconds - 5 minute mission limit
+HUMAN_TRACKING_TIME = 30        # seconds of AprilTag tracking before the QR search starts
+QR_SEARCH_TIMEOUT = 30          # seconds - time to search for QR after human tracking
+HOVER_TIME = 10                 # seconds - time to hover over QR after detection
+
+# Safety Timeouts
+VISION_LOSS_LAND_AFTER = 3.0    # s of no camera frames while flying -> land immediately
+VIDEO_TIMEOUT = 2.0             # seconds - video loss timeout
+TARGET_LOSS_TIMEOUT = 5.0       # seconds - AprilTag loss timeout
+MAVLINK_TIMEOUT = 3.0           # seconds - MAVLink connection loss timeout
+CONTROLLER_OUTPUT_SATURATION = 2.0  # m/s - maximum controller output
+
+# Aerial Survey Overlap (used by utils.utils for ground-coverage math)
+SIDE_OVERLAP = 0.0
+FRONT_OVERLAP = 0.0
+
+# Debug/Testing Modes
+DRY_RUN = False                 # If True, log commands instead of sending to drone
+SITL_MODE = False               # If True, using SITL for testing
+
+# Video source. "picamera2" = Pi Camera V2 through libcamera (the only source that can also stream to the GCS).
+VIDEO_SOURCE = "shm"      # Options: "shm" (frames from cam-daemon, default), "picamera2", "v4l2", "webcam", "video_file", "udp", "rtsp", "http"
+VIDEO_SOURCE_PATH = "/dev/video0"  # For v4l2: device path; for video_file: path to file; for UDP/RTSP/HTTP: the URL/source
+
+# Live video to the ground station (replaces fpv-video-ap.service while the mission runs: the camera
+# can only be opened by ONE process, so detection and streaming share the same capture).
+STREAM_ENABLE = True
+STREAM_HOST = "192.168.4.10"    # GCS laptop on the DRONE-GCS hotspot
+STREAM_PORT = 5600
+STREAM_SIZE = (1280, 960)       # 4:3, same field of view as the detection frame
+STREAM_BITRATE = 2_500_000
+# WFB-ng long-range mode: video goes to the local wfb_tx video service (same pipe fpv-video.service uses)
+WFB_STREAM_HOST = "127.0.0.1"
+WFB_STREAM_PORT = 5602
+
+
+def stream_target():
+    """Where the H.264 RTP stream goes: the hotspot laptop when /etc/drone-mode exists (drone-mode ap),
+    otherwise the local WFB-ng video service."""
+    import os
+    if os.path.exists("/etc/drone-mode"):
+        return STREAM_HOST, STREAM_PORT
+    return WFB_STREAM_HOST, WFB_STREAM_PORT
+# Camera-owning systemd units stopped during a run and restarted afterwards (needs passwordless sudo)
+MANAGE_VIDEO_SERVICES = True
+VIDEO_SERVICES = ["fpv-video-ap.service", "fpv-video.service"]
+
+# MAVLink Connection.
+# "tcp"    = through fc-tcp-bridge.service (127.0.0.1:5760). The bridge is the ONLY process that opens
+#            /dev/ttyS0, so this never fails with "port already in use" and Mission Planner can stay connected.
+# "serial" = open the UART directly (only when no bridge is running).
+# "udp"    = bench/SITL.
+MAVLINK_CONNECTION = "tcp"      # Options: "tcp", "serial", "udp"
+MAVLINK_TCP = "127.0.0.1:5760"
+MAVLINK_SERIAL_DEVICE = "/dev/ttyS0"
+MAVLINK_BAUDRATE = 115200       # must match the bridge / FC SERIALx_BAUD
+MAVLINK_UDP_PORT = 14551        # Fallback for bench-testing against SITL over UDP
+MAVLINK_HEARTBEAT_WAIT = 60     # seconds to wait for the autopilot heartbeat at start-up
+
+# Logging Configuration
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(filename)s -> %(asctime)s-[%(levelname)s]: %(lineno)d - \n %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+def get_camera_dimensions():
+    """Get camera dimensions as tuple"""
+    return (CAMERA_WIDTH, CAMERA_HEIGHT)
+
+def get_image_center():
+    """Get image center coordinates"""
+    return (CAMERA_WIDTH // 2, CAMERA_HEIGHT // 2)
+
+
+# Safety check at import time: every configured altitude must respect the ceiling.
+for _name in ("FLIGHT_ALTITUDE", "TAKEOFF_ALTITUDE", "SURVEY_ALTITUDE", "QR_SEARCH_ALTITUDE", "QR_HOVER_ALT"):
+    if globals()[_name] > MAX_ALTITUDE:
+        raise ValueError(f"config: {_name}={globals()[_name]} m exceeds MAX_ALTITUDE={MAX_ALTITUDE} m")

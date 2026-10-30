@@ -1,0 +1,74 @@
+"""
+Camera daemon (cam-daemon.service): the ONLY process that opens the Pi camera.
+
+  camera -> H.264 encoder -> gst-launch -> RTP/UDP to the GCS (WFB-ng 127.0.0.1:5602, or the hotspot laptop)
+         -> gray detection frames -> /dev/shm/drone_cam  (read by the mission's vision thread, cam/shm.py)
+
+Video therefore never pauses when a mission starts, stops or crashes. The stream target is chosen at start from
+the current link mode (utils.config.stream_target); drone-mode restarts this service when the mode changes.
+Without a camera it just retries every 5 s.
+"""
+import signal
+import time
+
+from utils.logger import logger
+from utils import config as cfg
+from cam.capture import Picamera2Capture
+from cam.shm import ShmPublisher
+
+_stop = False
+
+
+def _handle(_sig, _frm):
+    global _stop
+    _stop = True
+
+
+def main():
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+    w, h = cfg.CAMERA_WIDTH, cfg.CAMERA_HEIGHT
+    stream = None
+    if cfg.STREAM_ENABLE:
+        host, port = cfg.stream_target()
+        stream = dict(host=host, port=port, size=cfg.STREAM_SIZE, bitrate=cfg.STREAM_BITRATE)
+    pub = ShmPublisher(w, h)
+    warned = False
+    while not _stop:
+        try:
+            cap = Picamera2Capture(size=(w, h), fps=cfg.CAMERA_FPS, stream=stream)
+        except Exception as e:  # noqa: BLE001
+            if not warned:
+                logger.error(f"Camera not available ({e}) - retrying every 5 s")
+                warned = True
+            for _ in range(50):
+                if _stop:
+                    break
+                time.sleep(0.1)
+            continue
+        warned = False
+        logger.info(f"Camera daemon running, stream -> {stream and (stream['host'], stream['port'])}")
+        fails = 0
+        try:
+            while not _stop:
+                try:
+                    ok, gray = cap.read_gray()
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Camera read failed: {e}")
+                    break
+                if not ok:
+                    fails += 1
+                    if fails > 100:
+                        break
+                    time.sleep(0.01)
+                    continue
+                fails = 0
+                pub.publish(gray)
+        finally:
+            cap.release()
+            logger.info("Camera released")
+    pub.close()
+
+
+if __name__ == "__main__":
+    main()
